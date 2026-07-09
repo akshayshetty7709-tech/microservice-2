@@ -1,0 +1,39 @@
+---
+- name: Install containerd.io
+  apt:
+    name: containerd.io
+    state: present
+    update_cache: true
+
+- name: Create containerd config directory
+  file:
+    path: /etc/containerd
+    state: directory
+
+- name: Generate default containerd config
+  shell: containerd config default > /etc/containerd/config.toml
+  args:
+    creates: /etc/containerd/config.toml
+
+- name: Enable SystemdCgroup in containerd config
+  lineinfile:
+    path: /etc/containerd/config.toml
+    regexp: '^(\s*)SystemdCgroup = false'
+    line: '\1SystemdCgroup = true'
+    backrefs: true
+
+- name: Restart containerd
+  systemd:
+    name: containerd
+    state: restarted
+    enabled: true
+
+- name: Disable swap (idempotent)
+  shell: swapoff -a
+  changed_when: false
+
+- name: Remove swap entry from fstab
+  lineinfile:
+    path: /etc/fstab
+    regexp: '.*swap.*'
+    state: absent

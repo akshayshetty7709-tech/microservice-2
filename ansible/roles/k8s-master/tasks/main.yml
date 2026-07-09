@@ -1,0 +1,55 @@
+---
+- name: Check if cluster already initialized
+  stat:
+    path: /etc/kubernetes/admin.conf
+  register: kubeadm_init_done
+
+- name: Initialize Kubernetes control plane
+  command: >
+    kubeadm init
+    --apiserver-advertise-address={{ ansible_default_ipv4.address }}
+    --pod-network-cidr={{ pod_network_cidr }}
+    --upload-certs
+  when: not kubeadm_init_done.stat.exists
+  register: kubeadm_init
+
+- name: Create .kube directory for ansible user
+  file:
+    path: "/home/{{ ansible_user }}/.kube"
+    state: directory
+    owner: "{{ ansible_user }}"
+    mode: '0755'
+
+- name: Copy admin.conf to user kubeconfig
+  copy:
+    src: /etc/kubernetes/admin.conf
+    dest: "/home/{{ ansible_user }}/.kube/config"
+    owner: "{{ ansible_user }}"
+    remote_src: true
+
+- name: Install Calico CNI
+  become_user: "{{ ansible_user }}"
+  command: kubectl --kubeconfig=/home/{{ ansible_user }}/.kube/config apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.28.0/manifests/calico.yaml
+  when: not kubeadm_init_done.stat.exists
+
+- name: Generate fresh worker join command
+  command: kubeadm token create --print-join-command
+  register: join_command_raw
+
+- name: Store join command as fact for worker nodes
+  set_fact:
+    kubeadm_join_command: "{{ join_command_raw.stdout }}"
+
+- name: Persist join command to local file (used by playbook to hand off to workers)
+  copy:
+    content: "{{ join_command_raw.stdout }}"
+    dest: "{{ playbook_dir }}/../.generated/join-command.sh"
+  delegate_to: localhost
+  become: false
+
+- name: Install NGINX Ingress Controller
+  become_user: "{{ ansible_user }}"
+  command: >
+    kubectl --kubeconfig=/home/{{ ansible_user }}/.kube/config apply
+    -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.11.0/deploy/static/provider/baremetal/deploy.yaml
+  when: not kubeadm_init_done.stat.exists

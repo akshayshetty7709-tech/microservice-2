@@ -1,0 +1,6 @@
+apiVersion: v2
+name: locate360-service
+description: Reusable chart for any Locate360 microservice
+type: application
+version: 1.0.0
+appVersion: "1.0.0"

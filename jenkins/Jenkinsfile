@@ -1,0 +1,222 @@
+// Master pipeline: Terraform -> Ansible -> Docker -> Harbor -> Vault ->
+// Helm -> Prometheus -> Grafana -> Frontend -> CloudFront invalidation.
+//
+// Requires Jenkins plugins: HashiCorp Vault, Kubernetes CLI, Pipeline Utility
+// Steps, AWS Steps, Git, and credentials configured in Jenkins Credentials
+// Store (never hardcode secrets in this file):
+//   git-locate360-creds  -> SSH key / token with read access to all 22 repos
+//                           AND the separate frontend repo
+//   harbor-registry-creds, vault-approle, aws-locate360, locate360-kubeconfig
+
+def FRONTEND_REPO = 'git@company-git:locate360/frontend.git'
+
+// Each of the 22 services lives in its own repo. Map service name -> repo URL.
+// (Swap the git@... pattern for whatever your Git host convention is —
+// this assumes one org with one repo per service, all same naming pattern.)
+def SERVICES = [
+  'auth-service'          : 'git@company-git:locate360/auth-service.git',
+  'user-service'          : 'git@company-git:locate360/user-service.git',
+  'search-service'        : 'git@company-git:locate360/search-service.git',
+  'review-service'        : 'git@company-git:locate360/review-service.git',
+  'notification-service'  : 'git@company-git:locate360/notification-service.git',
+  'payment-service'       : 'git@company-git:locate360/payment-service.git',
+  'business-service'      : 'git@company-git:locate360/business-service.git',
+  'media-service'         : 'git@company-git:locate360/media-service.git',
+  'geo-service'           : 'git@company-git:locate360/geo-service.git',
+  'booking-service'       : 'git@company-git:locate360/booking-service.git',
+  'analytics-service'     : 'git@company-git:locate360/analytics-service.git',
+  'recommendation-service': 'git@company-git:locate360/recommendation-service.git',
+  'chat-service'          : 'git@company-git:locate360/chat-service.git',
+  'rating-service'        : 'git@company-git:locate360/rating-service.git',
+  'admin-service'         : 'git@company-git:locate360/admin-service.git',
+  'gateway-service'       : 'git@company-git:locate360/gateway-service.git',
+  'catalog-service'       : 'git@company-git:locate360/catalog-service.git',
+  'reporting-service'     : 'git@company-git:locate360/reporting-service.git',
+  'inventory-service'     : 'git@company-git:locate360/inventory-service.git',
+  'audit-service'         : 'git@company-git:locate360/audit-service.git',
+  'settings-service'      : 'git@company-git:locate360/settings-service.git',
+  'webhook-service'       : 'git@company-git:locate360/webhook-service.git'
+]
+
+pipeline {
+  agent any
+
+  parameters {
+    booleanParam(name: 'RUN_TERRAFORM', defaultValue: false, description: 'Provision/modify infra')
+    booleanParam(name: 'RUN_ANSIBLE',   defaultValue: false, description: 'Configure the K8s cluster')
+    string(name: 'IMAGE_TAG', defaultValue: "${env.BUILD_NUMBER}", description: 'Docker image tag for this run')
+    booleanParam(name: 'DEPLOY_FRONTEND', defaultValue: true)
+  }
+
+  environment {
+    HARBOR_REGISTRY   = 'harbor.company.internal/locate360'
+    VAULT_ADDR        = 'https://vault.company.internal:8200'
+    KUBECONFIG        = credentials('locate360-kubeconfig')
+    HARBOR_CREDS      = credentials('harbor-registry-creds')
+    SONARQUBE_ENV     = 'locate360-sonarqube'
+  }
+
+  stages {
+
+    stage('Checkout Platform Repo') {
+      // This repo: terraform/ansible/helm/docker-template/jenkins/monitoring.
+      // Service source code is NOT here — it's cloned per-service below.
+      steps { checkout scm }
+    }
+
+    stage('Checkout All Service Repos') {
+      steps {
+        script {
+          SERVICES.each { svc, repoUrl ->
+            dir("repos/${svc}") {
+              checkout([$class: 'GitSCM',
+                branches: [[name: '*/main']],
+                userRemoteConfigs: [[url: repoUrl, credentialsId: 'git-locate360-creds']]
+              ])
+            }
+          }
+          dir('repos/frontend') {
+            checkout([$class: 'GitSCM',
+              branches: [[name: '*/main']],
+              userRemoteConfigs: [[url: FRONTEND_REPO, credentialsId: 'git-locate360-creds']]
+            ])
+          }
+        }
+      }
+    }
+
+    stage('Terraform Provision') {
+      when { expression { params.RUN_TERRAFORM } }
+      steps {
+        dir('terraform/envs/dev') {
+          sh 'terraform init -input=false'
+          sh 'terraform validate'
+          sh 'terraform plan -out=tfplan -input=false'
+          sh 'terraform apply -input=false -auto-approve tfplan'
+        }
+        sh 'bash scripts/generate_inventory.sh'
+        archiveArtifacts artifacts: 'ansible/inventory/hosts.ini', fingerprint: true
+      }
+    }
+
+    stage('Ansible Configure Cluster') {
+      when { expression { params.RUN_ANSIBLE } }
+      steps {
+        dir('ansible') {
+          sh 'ansible-playbook -i inventory/hosts.ini site.yml'
+        }
+      }
+    }
+
+    stage('Build & Analyze Services') {
+      steps {
+        script {
+          SERVICES.each { svc, repoUrl ->
+            dir("repos/${svc}") {
+              // Inject the ONE shared template into this service's checkout.
+              // Each repo owns its src/, package.json, tests — nothing about
+              // the build logic is duplicated or hand-maintained per repo.
+              sh "cp ${WORKSPACE}/docker/Dockerfile.template ./Dockerfile"
+              sh "cp ${WORKSPACE}/docker/.dockerignore ./.dockerignore"
+              sh "docker build -t ${HARBOR_REGISTRY}/${svc}:${params.IMAGE_TAG} ."
+              withSonarQubeEnv(SONARQUBE_ENV) {
+                sh "sonar-scanner -Dsonar.projectKey=locate360-${svc} -Dsonar.sources=."
+              }
+            }
+          }
+        }
+      }
+    }
+
+    stage('Quality Gate') {
+      steps {
+        timeout(time: 15, unit: 'MINUTES') {
+          waitForQualityGate abortPipeline: true
+        }
+      }
+    }
+
+    stage('Push to Harbor') {
+      steps {
+        sh 'echo "$HARBOR_CREDS_PSW" | docker login $HARBOR_REGISTRY -u "$HARBOR_CREDS_USR" --password-stdin'
+        script {
+          SERVICES.each { svc, repoUrl ->
+            sh "docker push ${HARBOR_REGISTRY}/${svc}:${params.IMAGE_TAG}"
+          }
+        }
+      }
+    }
+
+    stage('Retrieve Secrets from Vault') {
+      steps {
+        script {
+          SERVICES.each { svc, repoUrl ->
+            withVault(
+              configuration: [vaultUrl: VAULT_ADDR, vaultCredentialId: 'vault-approle'],
+              vaultSecrets: [[
+                path: "secret/data/locate360/${svc}",
+                secretValues: [
+                  [envVar: 'MONGO_URI',   vaultKey: 'mongo_uri'],
+                  [envVar: 'JWT_SECRET',  vaultKey: 'jwt_secret'],
+                  [envVar: 'REDIS_URL',   vaultKey: 'redis_url'],
+                  [envVar: 'KAFKA_CREDS', vaultKey: 'kafka_creds']
+                ]
+              ]]
+            ) {
+              sh """
+                helm upgrade --install ${svc} ./helm/locate360-service \
+                  -f ./helm/values/${svc}.yaml \
+                  --set image.tag=${params.IMAGE_TAG} \
+                  --set-string secret.data.MONGO_URI="\$(echo -n \$MONGO_URI | base64 -w0)" \
+                  --set-string secret.data.JWT_SECRET="\$(echo -n \$JWT_SECRET | base64 -w0)" \
+                  --set-string secret.data.REDIS_URL="\$(echo -n \$REDIS_URL | base64 -w0)" \
+                  --set-string secret.data.KAFKA_CREDS="\$(echo -n \$KAFKA_CREDS | base64 -w0)"
+              """
+            }
+          }
+        }
+      }
+    }
+
+    stage('Prometheus & Grafana') {
+      steps {
+        sh '''
+          helm repo add prometheus-community https://prometheus-community.github.io/helm-charts || true
+          helm repo add grafana https://grafana.github.io/helm-charts || true
+          helm repo update
+          helm upgrade --install prometheus prometheus-community/kube-prometheus-stack \
+            -f monitoring/prometheus/values.yaml -n monitoring --create-namespace
+          helm upgrade --install grafana grafana/grafana \
+            -f monitoring/grafana/values.yaml -n monitoring --create-namespace
+          kubectl apply -n monitoring -f monitoring/grafana/dashboard-configmap.yaml
+        '''
+      }
+    }
+
+    stage('Frontend Build & Deploy') {
+      when { expression { params.DEPLOY_FRONTEND } }
+      steps {
+        dir('repos/frontend') {
+          sh 'npm ci && npm run build'
+          withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-locate360']]) {
+            script {
+              def bucket = sh(script: "terraform -chdir=${WORKSPACE}/terraform/envs/dev output -raw s3_bucket_name", returnStdout: true).trim()
+              def distId = sh(script: "terraform -chdir=${WORKSPACE}/terraform/envs/dev output -raw cloudfront_distribution_id", returnStdout: true).trim()
+              sh "aws s3 sync build/ s3://${bucket} --delete"
+              sh "aws cloudfront create-invalidation --distribution-id ${distId} --paths '/*'"
+            }
+          }
+        }
+      }
+    }
+  }
+
+  post {
+    success {
+      echo 'Locate360 full pipeline completed successfully.'
+    }
+    failure {
+      echo 'Pipeline failed — check stage logs above.'
+    }
+  }
+}

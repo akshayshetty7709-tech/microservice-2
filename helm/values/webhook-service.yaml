@@ -1,0 +1,8 @@
+nameOverride: webhook-service
+image:
+  repository: harbor.company.internal/locate360/webhook-service
+  tag: "1.0.0"
+ingress:
+  host: webhook-service.locate360.internal
+vault:
+  path: secret/data/locate360/webhook-service

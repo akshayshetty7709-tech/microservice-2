@@ -1,0 +1,31 @@
+# values.yaml for grafana/grafana helm chart
+adminUser: admin
+adminPassword: "" # injected via --set from Vault at deploy time, never committed
+
+datasources:
+  datasources.yaml:
+    apiVersion: 1
+    datasources:
+      - name: Prometheus
+        type: prometheus
+        url: http://prometheus-kube-prometheus-prometheus.monitoring.svc:9090
+        access: proxy
+        isDefault: true
+
+dashboardProviders:
+  dashboardproviders.yaml:
+    apiVersion: 1
+    providers:
+      - name: locate360
+        orgId: 1
+        folder: Locate360
+        type: file
+        options:
+          path: /var/lib/grafana/dashboards/locate360
+
+dashboardsConfigMaps:
+  locate360: locate360-grafana-dashboard
+
+persistence:
+  enabled: true
+  size: 5Gi
