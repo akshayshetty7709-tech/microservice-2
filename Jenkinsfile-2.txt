@@ -1,0 +1,76 @@
+pipeline {
+    agent any
+
+    parameters {
+        string(name: 'GITHUB_URL', defaultValue: '', description: 'Deployment service Git-hub URL')
+        string(name: 'BRANCH_NAME', defaultValue: 'main', description: 'Name of the branch')
+        string(name: 'IMAGE_NAME', defaultValue: '', description: 'Name of the image')
+        string(name: 'DIR_NAME', defaultValue: '.', description: 'Source code directory')
+    }
+
+    environment {
+        HARBOR_PATH = 'harbor.example.com/project/${params.IMAGE_NAME}'
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                git branch: "${params.BRANCH_NAME}", url: "${params.GITHUB_URL}"
+            }
+        }
+
+        stage('Build docker image') {
+            steps {
+                dir("${params.DIR_NAME}") {
+                    sh """
+                    docker build -t ${params.IMAGE_NAME} .
+                    """
+                }
+            }
+        }
+
+        stage('docker tag image') {
+            steps {
+                sh """
+                docker tag ${params.IMAGE_NAME} ${env.HARBOR_PATH}:$BUILD_NUMBER
+                docker tag ${params.IMAGE_NAME} ${env.HARBOR_PATH}:latest
+                """
+            }
+        }
+
+        stage('push image to harbor') {
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'harbor-cred', usernameVariable: 'HARBOR_USER', passwordVariable: 'HARBOR_PASSWORD')]) {
+                    sh """
+                    echo \$HARBOR_PASSWORD | docker login harbor.example.com -u \$HARBOR_USER --password-stdin
+                    docker push ${env.HARBOR_PATH}:$BUILD_NUMBER
+                    docker push ${env.HARBOR_PATH}:latest
+                    """
+                }
+            }
+        }
+
+        stage('clean up local docker images') {
+            steps {
+                sh """
+                docker rmi ${params.IMAGE_NAME}
+                docker rmi ${env.HARBOR_PATH}:$BUILD_NUMBER
+                docker rmi ${env.HARBOR_PATH}:latest
+                """
+            }
+        }
+    }
+
+    post {
+        always {
+            sh 'docker logout harbor.example.com || true'
+        }
+        success {
+            echo "Build #${env.BUILD_NUMBER} pushed to Harbor successfully."
+        }
+        failure {
+            echo "Build #${env.BUILD_NUMBER} failed."
+        }
+    }
+}
